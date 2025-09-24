@@ -38,24 +38,29 @@ class AITextGenerator:
         self.costs = {"total": 0.0, "openai": 0.0, "anthropic": 0.0}
         
         # Universal system prompt for generating natural, human-like text
-        self.universal_system_prompt = """You are writing as a real human with authentic thoughts and natural expression. Your goal is to produce text that sounds genuinely human-written, not AI-generated.
+        self.universal_system_prompt_template = """You are writing as a real human with authentic thoughts and natural expression. Your goal is to produce text that sounds genuinely human-written, not AI-generated. This text will later be used to test AI text detectors.
 
-Key guidelines:
-- Write 400-800 words to provide substantial content for testing
-- Use natural, conversational language with some imperfections
-- Include personal perspectives, experiences, or opinions where relevant
-- Vary your sentence structure - mix short and long sentences
-- Add natural tangents, asides, or brief digressions that humans often include
-- Use contractions, informal phrases, and authentic voice
-- Include minor grammatical quirks or colloquialisms that real people use
-- Don't be overly structured or perfect - let ideas flow naturally
-- Add personal touches like "I think," "in my experience," or "honestly"
-- Include some redundancy or repetition that occurs in natural speech
-- Use transitions that feel conversational rather than academic
-- Express uncertainty or multiple viewpoints when appropriate
-- Make it feel like something a knowledgeable person would actually write
+Core guidelines for human-like writing:
+- Write with natural flow and authentic voice - imagine you're explaining to a friend
+- Include personal touches: "I think," "in my experience," "honestly," "to be fair"
+- Use varied sentence structure: mix short punchy statements with longer, meandering thoughts
+- Add natural tangents and asides that humans include when they get excited about a topic
+- Include some redundancy, minor repetition, or slight contradictions that happen in natural speech
+- Use contractions, informal phrases, and conversational connectors ("So," "But here's the thing," "Actually,")
+- Don't be overly structured - let ideas flow organically with some messiness
+- Include uncertainty, multiple viewpoints, or admissions of not knowing everything
+- Add relatable examples from everyday life or common experiences
+- Use humor, mild frustration, or genuine enthusiasm where appropriate
+- Include some grammatical quirks or colloquialisms that real people use
+- Make transitions feel conversational rather than academic ("Speaking of which," "Oh, and another thing")
 
-Remember: The goal is to create content that's engaging, substantial, and authentically human-sounding - the kind of text that would be challenging for AI detectors to identify as machine-generated."""
+{length_instruction}
+
+{style_instruction}
+
+{additional_context}
+
+Remember: Write like a knowledgeable person having a genuine conversation. The goal is creating content so authentically human that even sophisticated AI detectors would struggle to identify it as machine-generated. Be engaging, substantial, and real."""
         
         # Initialize OpenAI client
         openai_key = os.getenv('OPENAI_API_KEY')
@@ -81,9 +86,38 @@ Remember: The goal is to create content that's engaging, substantial, and authen
             except Exception as e:
                 print(f"⚠️ Anthropic client initialization failed: {e}")
     
-    def get_universal_system_prompt(self) -> str:
-        """Get the universal system prompt for generating human-like text."""
-        return self.universal_system_prompt
+    def get_universal_system_prompt(self, temperature: float = 0.7, max_tokens: int = 500, style: str = "", domain: str = "") -> str:
+        """Get the universal system prompt with parameter-based instructions."""
+        
+        # Length instruction based on max_tokens
+        if max_tokens <= 300:
+            length_instruction = "Target length: Write 200-400 words - be concise but natural, like a focused conversation."
+        elif max_tokens <= 500:
+            length_instruction = "Target length: Write 400-600 words - develop your thoughts with examples and personal touches."
+        elif max_tokens <= 800:
+            length_instruction = "Target length: Write 600-900 words - explore the topic thoroughly with tangents and detailed explanations."
+        else:
+            length_instruction = "Target length: Write 800+ words - be comprehensive, include multiple perspectives, detailed examples, and natural digressions."
+        
+        # Style instruction based on temperature
+        if temperature <= 0.3:
+            style_instruction = """Writing style: Be thoughtful and measured. Include careful reasoning, acknowledge nuances, and show you've considered different angles. Use phrases like "I think," "it seems to me," or "from what I understand." Be precise but still conversational."""
+        elif temperature <= 0.7:
+            style_instruction = """Writing style: Strike a balanced tone - informative but personable. Mix analytical thinking with relatable examples. Show both expertise and humility ("I've found that..." or "In my experience..."). Be engaging without being overly casual."""
+        else:
+            style_instruction = """Writing style: Be expressive and enthusiastic! Use vivid language, show excitement about interesting points, include humor or mild exaggeration where natural. Don't be afraid of tangents, personal anecdotes, or showing strong opinions. Sound like someone genuinely passionate about the topic."""
+        
+        # Additional context based on domain/style
+        additional_context = ""
+        if domain or style:
+            additional_context = f"Context: This is {style} content about {domain}. " if domain and style else f"Context: This is {style or domain} content. "
+            additional_context += "Adapt your voice accordingly while maintaining the human authenticity described above."
+        
+        return self.universal_system_prompt_template.format(
+            length_instruction=length_instruction,
+            style_instruction=style_instruction,
+            additional_context=additional_context
+        )
 
     def _model_restrictions(self, model: str) -> Dict[str, Any]:
         """Return model-specific parameter restrictions."""
@@ -455,10 +489,15 @@ class PromptBasedTester:
         
         for item in tqdm(prompts_data, desc="Processing items"):
             if item['type'].lower() == 'prompt':
-                # Get universal system prompt for human-like generation
-                system_prompt = self.generator.get_universal_system_prompt()
+                # Get universal system prompt with parameter-based instructions for human-like generation
+                system_prompt = self.generator.get_universal_system_prompt(
+                    temperature=item['temperature'],
+                    max_tokens=item['max_tokens'],
+                    style=item['style'],
+                    domain=item['domain']
+                )
                 
-                # Generate AI text with system prompt
+                # Generate AI text with enhanced system prompt
                 result = self.generator.generate_text(
                     item['content'],
                     item['model'],
