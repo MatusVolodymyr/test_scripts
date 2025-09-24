@@ -1,0 +1,7 @@
+venv/
+prompt_test_script/test_results/*
+__pycache__/
+*.pyc
+.vscode/
+text_test_script/test_results/*
+.env
