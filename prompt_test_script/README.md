@@ -92,14 +92,14 @@ To make AI-generated text more realistic and human-like, the script uses system 
 ## Supported AI Models
 
 ### OpenAI Models
-- `gpt-4`
-- `gpt-4-turbo`
-- `gpt-3.5-turbo`
+- `gpt-4.1`
+- `gpt-4o`
+- `gpt-5` and other variants, but make shure you have temperature set to 1, for all of them
 
 ### Anthropic Models
-- `claude-3-opus-20240229`
-- `claude-3-sonnet-20240229`
-- `claude-3-haiku-20240307`
+- `claude-4-opus`
+- `claude-4-sonnet`
+- `claude-4-haiku`
 
 ## Output Files
 

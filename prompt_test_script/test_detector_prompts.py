@@ -11,7 +11,7 @@ Usage:
     python test_detector_prompts.py --input generated_test_data.csv --test-only
 
 CSV Format:
-    type,content,model,temperature,max_tokens,style,domain,expected_label,confidence,language,notes,human_style
+    type,content,model,temperature,max_tokens,style,domain,expected_label,confidence,language,notes
 """
 
 import argparse
@@ -37,28 +37,25 @@ class AITextGenerator:
         self.anthropic_client = None
         self.costs = {"total": 0.0, "openai": 0.0, "anthropic": 0.0}
         
-        # System prompts for different content types to make AI text more human-like
-        self.system_prompts = {
-            "student_essay": "You are a college student writing an essay for class. Write in a natural, slightly informal academic style with some minor imperfections, personal opinions, and the occasional awkward phrasing that real students use. Don't be overly polished or professional.",
-            
-            "social_media": "You are writing a social media post or comment. Use casual language, some slang, maybe typos or abbreviations. Be conversational and authentic like a real person posting online. Don't be too formal or structured.",
-            
-            "blog_post": "You are a blogger writing a personal blog post. Use a conversational tone, share personal thoughts and experiences, and write like you're talking to a friend. Include some tangents and personal anecdotes.",
-            
-            "forum_comment": "You are commenting on an online forum or discussion board. Write like a real person participating in a discussion - casual, opinionated, maybe a bit rambling. Include personal experiences and observations.",
-            
-            "email_casual": "You are writing a casual email to a friend or colleague. Use a conversational tone, natural language, and the kind of informal structure people actually use in emails.",
-            
-            "homework_answer": "You are a student answering a homework question or assignment. Write in a somewhat formal but not perfect academic style, showing your thought process and explaining things as a student would.",
-            
-            "review_comment": "You are writing a review or comment about a product, service, or experience. Write from personal experience with genuine opinions, both positive and negative aspects.",
-            
-            "news_comment": "You are commenting on a news article or current event. Express your personal opinion in a conversational way, like a real person discussing the news with others.",
-            
-            "tutorial_informal": "You are explaining something you know well to someone else in an informal, helpful way. Use simple language and personal examples, like you're helping a friend understand something.",
-            
-            "personal_story": "You are sharing a personal experience or story. Write naturally and conversationally, with the kind of details and tangents that people include when telling real stories."
-        }
+        # Universal system prompt for generating natural, human-like text
+        self.universal_system_prompt = """You are writing as a real human with authentic thoughts and natural expression. Your goal is to produce text that sounds genuinely human-written, not AI-generated.
+
+Key guidelines:
+- Write 400-800 words to provide substantial content for testing
+- Use natural, conversational language with some imperfections
+- Include personal perspectives, experiences, or opinions where relevant
+- Vary your sentence structure - mix short and long sentences
+- Add natural tangents, asides, or brief digressions that humans often include
+- Use contractions, informal phrases, and authentic voice
+- Include minor grammatical quirks or colloquialisms that real people use
+- Don't be overly structured or perfect - let ideas flow naturally
+- Add personal touches like "I think," "in my experience," or "honestly"
+- Include some redundancy or repetition that occurs in natural speech
+- Use transitions that feel conversational rather than academic
+- Express uncertainty or multiple viewpoints when appropriate
+- Make it feel like something a knowledgeable person would actually write
+
+Remember: The goal is to create content that's engaging, substantial, and authentically human-sounding - the kind of text that would be challenging for AI detectors to identify as machine-generated."""
         
         # Initialize OpenAI client
         openai_key = os.getenv('OPENAI_API_KEY')
@@ -84,74 +81,118 @@ class AITextGenerator:
             except Exception as e:
                 print(f"⚠️ Anthropic client initialization failed: {e}")
     
-    def get_system_prompt(self, prompt_type: str) -> str:
-        """Get system prompt for making AI text more human-like."""
-        return self.system_prompts.get(prompt_type, "")
-    
+    def get_universal_system_prompt(self) -> str:
+        """Get the universal system prompt for generating human-like text."""
+        return self.universal_system_prompt
+
+    def _model_restrictions(self, model: str) -> Dict[str, Any]:
+        """Return model-specific parameter restrictions."""
+        if not model:
+            return {}
+        model_lower = model.lower()
+
+        # Preset GPT-5 variants ship with fixed decoding settings.
+        if model_lower.startswith("gpt-5"):
+            return {
+                "disallow_temperature": True,
+                "disallow_top_p": True,
+                "disallow_max_output_tokens": True,
+            }
+
+        return {}
+
+    def _call_openai_responses(self, prompt: str, model: str, temperature: float, max_tokens: int, system_prompt: Optional[str]) -> Dict[str, Any]:
+        """Call the OpenAI Responses API used by GPT-5 / GPT-4.1 families."""
+        # Build inputs in the rich content format expected by the Responses API.
+        input_messages: List[Dict[str, Any]] = []
+        if system_prompt:
+            input_messages.append({
+                "role": "system",
+                "content": system_prompt
+            })
+        input_messages.append({
+            "role": "user",
+            "content": prompt
+        })
+
+        params: Dict[str, Any] = {
+            "model": model,
+            "input": input_messages,
+        }
+
+        restrictions = self._model_restrictions(model)
+        temperature_allowed = not restrictions.get("disallow_temperature", False)
+        max_tokens_allowed = not restrictions.get("disallow_max_output_tokens", False)
+
+        if temperature_allowed and temperature != 1.0:
+            params["temperature"] = temperature
+        elif not temperature_allowed and temperature != 1.0:
+            print(f"ℹ️ Model {model} enforces a fixed temperature; ignoring override {temperature}.")
+
+        if max_tokens_allowed and max_tokens:
+            params["max_output_tokens"] = max_tokens
+        elif not max_tokens_allowed and max_tokens:
+            print(f"ℹ️ Model {model} ignores max_output_tokens; using provider defaults instead.")
+
+        response = self.openai_client.responses.create(**params)
+
+        generated_text = getattr(response, "output_text", None)
+
+        if not generated_text:
+            # Fall back to manually assembling text from the structured output.
+            aggregated_chunks: List[str] = []
+            output_items = getattr(response, "output", None) or []
+            for item in output_items:
+                item_type = getattr(item, "type", None) or item.get("type")
+                if item_type != "message":
+                    continue
+                content_blocks = getattr(item, "content", None) or item.get("content", [])
+                for block in content_blocks:
+                    block_type = getattr(block, "type", None) or block.get("type")
+                    if block_type in ("text", "output_text"):
+                        text_value = getattr(block, "text", None) or block.get("text")
+                        if text_value:
+                            aggregated_chunks.append(text_value)
+            generated_text = "".join(aggregated_chunks)
+
+        if not generated_text:
+            return {"success": False, "error": f"Model {model} returned empty content"}
+
+        usage = getattr(response, "usage", None)
+        total_tokens: Optional[int] = None
+        if usage is not None:
+            total_attr = getattr(usage, "total_tokens", None)
+            if total_attr is None and isinstance(usage, dict):
+                total_attr = usage.get("total_tokens")
+            if isinstance(total_attr, (int, float)):
+                total_tokens = int(total_attr)
+            else:
+                input_tokens = getattr(usage, "input_tokens", None)
+                output_tokens = getattr(usage, "output_tokens", None)
+                if isinstance(usage, dict):
+                    input_tokens = input_tokens if isinstance(input_tokens, (int, float)) else usage.get("input_tokens")
+                    output_tokens = output_tokens if isinstance(output_tokens, (int, float)) else usage.get("output_tokens")
+                total_tokens = int((input_tokens or 0) + (output_tokens or 0))
+        if total_tokens is None:
+            total_tokens = 0
+
+        return {
+            "success": True,
+            "text": generated_text.strip(),
+            "tokens_used": total_tokens
+        }
+
     def generate_openai_text(self, prompt: str, model: str, temperature: float, max_tokens: int, system_prompt: str = None) -> Dict[str, Any]:
         """Generate text using OpenAI models."""
         if not self.openai_client:
             return {"success": False, "error": "OpenAI client not initialized"}
-        
+
         try:
-            # Prepare messages with optional system prompt
-            messages = []
-            if system_prompt:
-                messages.append({"role": "system", "content": system_prompt})
-            messages.append({"role": "user", "content": prompt})
-            
-            # Prepare parameters - some models don't support custom temperature
-            params = {
-                "model": model,
-                "messages": messages,
-                "max_completion_tokens": max_tokens
-            }
-            
-            # Only add temperature if it's not the default (1.0) or if model supports it
-            # GPT-5 models often only support temperature=1.0
-            if temperature != 1.0:
-                params["temperature"] = temperature
-            
-            response = self.openai_client.chat.completions.create(**params)
-            
-            generated_text = response.choices[0].message.content
-            tokens_used = response.usage.total_tokens
-            
-            return {
-                "success": True,
-                "text": generated_text.strip(),
-                "tokens_used": tokens_used
-            }
+            return self._call_openai_responses(prompt, model, temperature, max_tokens, system_prompt)
             
         except Exception as e:
             error_str = str(e)
-            
-            # If temperature is not supported(gpt-5 models), retry with default temperature
-            if "temperature" in error_str and "does not support" in error_str:
-                try:
-                    print(f"⚠️ Model {model} doesn't support custom temperature, retrying with default...")
-                    params_retry = {
-                        "model": model,
-                        "messages": [{"role": "user", "content": prompt}],
-                        "max_completion_tokens": max_tokens
-                        # No temperature parameter - use model default
-                    }
-                    
-                    response = self.openai_client.chat.completions.create(**params_retry)
-                    
-                    generated_text = response.choices[0].message.content
-                    tokens_used = response.usage.total_tokens
-                    
-                    return {
-                        "success": True,
-                        "text": generated_text.strip(),
-                        "tokens_used": tokens_used,
-                    }
-                    
-                except Exception as retry_e:
-                    return {"success": False, "error": f"Retry failed: {str(retry_e)}"}
-            
-            return {"success": False, "error": error_str}
+            return {"success": False, "error": f"Model {model}: {error_str}"}
     
     def generate_anthropic_text(self, prompt: str, model: str, temperature: float, max_tokens: int, system_prompt: str = None) -> Dict[str, Any]:
         """Generate text using Anthropic models."""
@@ -399,8 +440,7 @@ class PromptBasedTester:
                     'expected_label': row.get('expected_label', '').strip(),
                     'confidence': float(row.get('confidence', 1.0)) if row.get('confidence') else 1.0,
                     'language': row.get('language', 'en'),
-                    'notes': row.get('notes', ''),
-                    'human_style': row.get('human_style', '').strip()  # New field for system prompt type
+                    'notes': row.get('notes', '')
                 })
         
         print(f"Loaded {len(prompts_data)} items from {csv_file}")
@@ -415,8 +455,8 @@ class PromptBasedTester:
         
         for item in tqdm(prompts_data, desc="Processing items"):
             if item['type'].lower() == 'prompt':
-                # Get system prompt for human-like generation
-                system_prompt = self.generator.get_system_prompt(item.get('human_style', ''))
+                # Get universal system prompt for human-like generation
+                system_prompt = self.generator.get_universal_system_prompt()
                 
                 # Generate AI text with system prompt
                 result = self.generator.generate_text(
