@@ -18,6 +18,7 @@ import argparse
 import csv
 import json
 import os
+import sys
 import time
 from datetime import datetime
 from pathlib import Path
@@ -28,6 +29,14 @@ from dotenv import load_dotenv
 
 # Load environment variables
 load_dotenv(".env")
+
+# Try to import Prometheus client for metrics export
+try:
+    from prometheus_client import CollectorRegistry, Gauge, push_to_gateway
+    PROMETHEUS_AVAILABLE = True
+except ImportError:
+    PROMETHEUS_AVAILABLE = False
+    print("⚠️ prometheus-client not installed. Metrics push will be disabled.")
 
 class AITextGenerator:
     """Handles text generation from various AI models."""
@@ -602,6 +611,129 @@ class PromptBasedTester:
             json.dump(report, f, indent=2, ensure_ascii=False)
         
         print(f"Detailed report saved to: {output_file}")
+    
+    def save_results_jsonl(self, output_file: str) -> None:
+        """Save results in JSONL format for streaming/S3 storage."""
+        with open(output_file, 'w', encoding='utf-8') as f:
+            for result in self.tester.results:
+                f.write(json.dumps(result, ensure_ascii=False) + '\n')
+        
+        print(f"JSONL results saved to: {output_file}")
+    
+    def generate_manifest(self, output_file: str, run_id: str = None, 
+                         dataset_version: str = None, commit_sha: str = None) -> None:
+        """Generate manifest file with run metadata."""
+        metrics = self.tester.calculate_metrics()
+        
+        manifest = {
+            'run_id': run_id or os.getenv('RUN_ID', str(int(time.time()))),
+            'timestamp': datetime.now().isoformat(),
+            'dataset_version': dataset_version or os.getenv('DATASET_VERSION', 'unknown'),
+            'commit_sha': commit_sha or os.getenv('GIT_COMMIT_SHA', 'unknown'),
+            'detector_api_url': self.tester.api_url,
+            'total_samples': self.tester.stats['total_samples'],
+            'sample_breakdown': {
+                'ai_generated': len([r for r in self.tester.results 
+                                    if r.get('expected_label') == 'ai']),
+                'human_written': len([r for r in self.tester.results 
+                                     if r.get('expected_label') == 'human'])
+            },
+            'metrics': metrics,
+            'confusion_matrix': {
+                'true_positives': self.tester.stats['true_positives'],
+                'true_negatives': self.tester.stats['true_negatives'],
+                'false_positives': self.tester.stats['false_positives'],
+                'false_negatives': self.tester.stats['false_negatives']
+            },
+            'models_tested': list(set([
+                r.get('metadata', {}).get('model', 'unknown') 
+                for r in self.tester.results 
+                if r.get('metadata', {}).get('type') == 'generated'
+            ])),
+            'failed_requests': self.tester.stats['failed_requests']
+        }
+        
+        with open(output_file, 'w', encoding='utf-8') as f:
+            json.dump(manifest, f, indent=2, ensure_ascii=False)
+        
+        print(f"Manifest saved to: {output_file}")
+    
+    def push_metrics_to_prometheus(self, pushgateway_url: str, job_name: str = 'ai_detector_eval',
+                                   run_duration: float = 0) -> None:
+        """Push metrics to Prometheus Pushgateway."""
+        if not PROMETHEUS_AVAILABLE:
+            print("⚠️ Prometheus client not available, skipping metrics push")
+            return
+        
+        try:
+            metrics = self.tester.calculate_metrics()
+            registry = CollectorRegistry()
+            
+            # Success status (1 = success, 0 = failure)
+            success_gauge = Gauge('ai_detector_eval_success', 
+                                 'Evaluation run success status', 
+                                 registry=registry)
+            success_gauge.set(1 if self.tester.stats['failed_requests'] == 0 else 0)
+            
+            # Timestamp
+            timestamp_gauge = Gauge('ai_detector_eval_run_timestamp_seconds',
+                                   'Timestamp of evaluation run',
+                                   registry=registry)
+            timestamp_gauge.set(time.time())
+            
+            # Duration
+            duration_gauge = Gauge('ai_detector_eval_duration_seconds',
+                                  'Duration of evaluation run',
+                                  registry=registry)
+            duration_gauge.set(run_duration)
+            
+            # Sample counts by label
+            samples_gauge = Gauge('ai_detector_eval_samples_total',
+                                 'Total samples evaluated',
+                                 ['label'],
+                                 registry=registry)
+            ai_count = self.tester.stats['true_positives'] + self.tester.stats['false_negatives']
+            human_count = self.tester.stats['true_negatives'] + self.tester.stats['false_positives']
+            samples_gauge.labels(label='ai').set(ai_count)
+            samples_gauge.labels(label='human').set(human_count)
+            
+            # Confusion matrix
+            confusion_gauge = Gauge('ai_detector_eval_confusion_matrix',
+                                   'Confusion matrix counts',
+                                   ['kind'],
+                                   registry=registry)
+            confusion_gauge.labels(kind='tp').set(self.tester.stats['true_positives'])
+            confusion_gauge.labels(kind='tn').set(self.tester.stats['true_negatives'])
+            confusion_gauge.labels(kind='fp').set(self.tester.stats['false_positives'])
+            confusion_gauge.labels(kind='fn').set(self.tester.stats['false_negatives'])
+            
+            # Performance metrics
+            accuracy_gauge = Gauge('ai_detector_eval_accuracy',
+                                  'Overall accuracy',
+                                  registry=registry)
+            accuracy_gauge.set(metrics.get('accuracy', 0))
+            
+            precision_gauge = Gauge('ai_detector_eval_precision',
+                                   'Precision metric',
+                                   registry=registry)
+            precision_gauge.set(metrics.get('precision', 0))
+            
+            recall_gauge = Gauge('ai_detector_eval_recall',
+                                'Recall metric',
+                                registry=registry)
+            recall_gauge.set(metrics.get('recall', 0))
+            
+            f1_gauge = Gauge('ai_detector_eval_f1',
+                            'F1 score',
+                            registry=registry)
+            f1_gauge.set(metrics.get('f1_score', 0))
+            
+            # Push to gateway
+            push_to_gateway(pushgateway_url, job=job_name, registry=registry)
+            print(f"✅ Metrics pushed to Pushgateway: {pushgateway_url}")
+            
+        except Exception as e:
+            print(f"⚠️ Failed to push metrics to Prometheus: {e}")
 
 
 def main():
@@ -616,6 +748,15 @@ def main():
     parser.add_argument('--generate-and-test', action='store_true', help='Generate texts and test them')
     parser.add_argument('--quiet', action='store_true', help='Minimal console output')
     
+    # New: Production/automation arguments
+    parser.add_argument('--run-id', help='Unique run identifier (for tracking)')
+    parser.add_argument('--dataset-version', help='Dataset version label')
+    parser.add_argument('--commit-sha', help='Git commit SHA for tracking')
+    parser.add_argument('--pushgateway-url', help='Prometheus Pushgateway URL for metrics (or use PUSHGATEWAY_URL env var)')
+    parser.add_argument('--save-jsonl', action='store_true', help='Save results in JSONL format')
+    parser.add_argument('--save-manifest', action='store_true', help='Generate manifest.json with run metadata')
+    parser.add_argument('--exit-on-error', action='store_true', help='Exit with error code if any tests fail')
+    
     args = parser.parse_args()
     
     # Default to generate-and-test if no mode specified
@@ -629,6 +770,10 @@ def main():
     # Initialize tester
     tester = PromptBasedTester(args.api_url, args.token)
     
+    # Track run duration for metrics
+    start_time = time.time()
+    exit_code = 0
+    
     try:
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
         
@@ -639,7 +784,7 @@ def main():
             
             # Save generated data
             generated_file = output_dir / f'generated_test_data_{timestamp}.csv'
-            tester.save_generated_data(generated_file)
+            tester.save_generated_data(str(generated_file))
             
             if args.generate_only:
                 print(f"\n✅ Generation complete. Use this file for testing:")
@@ -661,18 +806,49 @@ def main():
             if not args.quiet:
                 tester.tester.print_summary()
             
+            # Calculate run duration
+            run_duration = time.time() - start_time
+            
             # Generate report
             report_file = output_dir / f'prompt_test_report_{timestamp}.json'
-            tester.generate_report(report_file)
+            tester.generate_report(str(report_file))
+            
+            # NEW: Save JSONL format if requested
+            if args.save_jsonl:
+                jsonl_file = output_dir / f'results_{timestamp}.jsonl'
+                tester.save_results_jsonl(str(jsonl_file))
+            
+            # NEW: Generate manifest if requested
+            if args.save_manifest:
+                manifest_file = output_dir / f'manifest_{timestamp}.json'
+                tester.generate_manifest(
+                    str(manifest_file),
+                    run_id=args.run_id,
+                    dataset_version=args.dataset_version,
+                    commit_sha=args.commit_sha
+                )
+            
+            # NEW: Push metrics to Prometheus if URL provided
+            pushgateway_url = args.pushgateway_url or os.getenv('PUSHGATEWAY_URL')
+            if pushgateway_url:
+                tester.push_metrics_to_prometheus(pushgateway_url, run_duration=run_duration)
+            
+            # Check for failures and set exit code
+            if args.exit_on_error and tester.tester.stats['failed_requests'] > 0:
+                print(f"\n❌ {tester.tester.stats['failed_requests']} requests failed")
+                exit_code = 1
         
     except KeyboardInterrupt:
-        print("\nTest interrupted by user")
+        print("\n⚠️ Test interrupted by user")
+        exit_code = 130  # Standard exit code for SIGINT
     except Exception as e:
-        print(f"Error: {e}")
-        return 1
+        print(f"❌ Error: {e}")
+        import traceback
+        traceback.print_exc()
+        exit_code = 1
     
-    return 0
+    return exit_code
 
 
 if __name__ == '__main__':
-    exit(main())
+    sys.exit(main())

@@ -1,0 +1,3 @@
+type,content,model,temperature,max_tokens,style,domain,expected_label,confidence,language,notes
+"prompt","Why renewable energy is important for our future and what are the main challenges we face in 2024","gpt-4o-mini",0.8,500,"analytical","energy","ai",1.0,"en","Student essay topic"
+"prompt","can someone explain machine learning like im 5? my brother keeps talking about it at dinner and i have no clue lol","gpt-5-nano",1.0,400,"simple","technology","ai",1.0,"en","Social media question"
