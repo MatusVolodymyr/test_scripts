@@ -105,13 +105,6 @@ Both testing modules generate detailed reports including:
 
 Results are saved in the respective `test_results/` directories with timestamps for easy comparison.
 
-## Contributing
-
-1. Fork the repository
-2. Create a feature branch
-3. Make your changes
-4. Add tests if applicable
-5. Submit a pull request
 
 ## Support
 
@@ -119,7 +112,3 @@ For detailed usage instructions and troubleshooting, refer to:
 - `prompt_test_script/README.md` for prompt-based testing
 - `text_test_script/README.md` for direct API testing
 - `prompt_test_script/QUICK_START.md` for quick setup guidance
-
-## License
-
-This project is provided as-is for testing and evaluation purposes.
