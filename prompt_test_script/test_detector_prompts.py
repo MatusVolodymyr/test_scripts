@@ -40,13 +40,20 @@ except ImportError:
     S3_AVAILABLE = False
     print("⚠️ boto3 not installed. S3 support will be disabled.")
 
-# Try to import Prometheus client for metrics export
+# Try to import OpenTelemetry for metrics export
 try:
-    from prometheus_client import CollectorRegistry, Gauge, push_to_gateway
-    PROMETHEUS_AVAILABLE = True
+    from opentelemetry import metrics
+    from opentelemetry.sdk.metrics import MeterProvider
+    from opentelemetry.sdk.metrics.export import PeriodicExportingMetricReader
+    from opentelemetry.exporter.prometheus_remote_write import (
+        PrometheusRemoteWriteMetricsExporter
+    )
+    from opentelemetry.sdk.resources import Resource, SERVICE_NAME
+    OTEL_AVAILABLE = True
 except ImportError:
-    PROMETHEUS_AVAILABLE = False
-    print("⚠️ prometheus-client not installed. Metrics push will be disabled.")
+    OTEL_AVAILABLE = False
+    print("⚠️ OpenTelemetry not installed. Metrics export will be disabled.")
+
 
 class AITextGenerator:
     """Handles text generation from various AI models."""
@@ -550,6 +557,56 @@ class PromptBasedTester:
         )
         self.s3_helper = S3Helper(s3_bucket, s3_prefix)
         self.generated_data = []
+        
+        # Initialize OpenTelemetry metrics if available
+        self.meter = None
+        self.metrics_exporter = None
+        if OTEL_AVAILABLE:
+            self._init_otel_metrics()
+    
+    def _init_otel_metrics(self):
+        """Initialize OpenTelemetry metrics provider and exporter."""
+        try:
+            remote_write_url = os.getenv('PROMETHEUS_REMOTE_WRITE_URL')
+            if not remote_write_url:
+                print("⚠️ PROMETHEUS_REMOTE_WRITE_URL not set, metrics export disabled")
+                return
+            
+            # Create resource with service information
+            resource = Resource.create({
+                SERVICE_NAME: "ai-detector-eval",
+                "environment": os.getenv("ENVIRONMENT", "local"),
+                "cluster": os.getenv("CLUSTER", "local-test"),
+            })
+            
+            # Configure Prometheus Remote Write exporter
+            self.metrics_exporter = PrometheusRemoteWriteMetricsExporter(
+                endpoint=remote_write_url,
+                headers={
+                    "X-Scope-OrgID": os.getenv("PROMETHEUS_TENANT_ID", "anonymous")
+                },
+                timeout=30
+            )
+            
+            # Create metric reader with periodic export
+            reader = PeriodicExportingMetricReader(
+                exporter=self.metrics_exporter,
+                export_interval_millis=5000  # Export every 5 seconds
+            )
+            
+            # Create and set meter provider
+            provider = MeterProvider(
+                resource=resource,
+                metric_readers=[reader]
+            )
+            
+            metrics.set_meter_provider(provider)
+            self.meter = metrics.get_meter("ai_detector_eval", "1.0.0")
+            
+            print("✅ OpenTelemetry metrics initialized")
+        except Exception as e:
+            print(f"⚠️ Failed to initialize OpenTelemetry metrics: {e}")
+            self.meter = None
     
     def load_prompts(self, csv_file: str) -> List[Dict[str, Any]]:
         """Load prompts and human texts from local CSV file."""
@@ -811,121 +868,134 @@ class PromptBasedTester:
         if self.s3_helper.is_available():
             self.s3_helper.upload_file(output_file)
     
-    def push_metrics_to_prometheus(self, pushgateway_url: str = None, job_name: str = 'ai_detector_eval',
-                                   run_duration: float = 0, use_remote_write: bool = False) -> None:
-        """Push metrics to Prometheus Pushgateway or via remote write."""
-        if not PROMETHEUS_AVAILABLE:
-            print("⚠️ Prometheus client not available, skipping metrics push")
+    def export_metrics_to_mimir(self, run_duration: float = 0) -> None:
+        """Export metrics to Mimir via OpenTelemetry Remote Write."""
+        if not OTEL_AVAILABLE:
+            print("⚠️ OpenTelemetry not available, skipping metrics export")
             return
         
-        # Get remote write URL from env if not using pushgateway
-        remote_write_url = os.getenv('PROMETHEUS_REMOTE_WRITE_URL')
-        
-        if use_remote_write and not remote_write_url:
-            print("⚠️ Remote write requested but PROMETHEUS_REMOTE_WRITE_URL not set")
-            return
-        
-        if not use_remote_write and not pushgateway_url:
-            print("⚠️ No Prometheus endpoint configured")
+        if not self.meter:
+            print("⚠️ Metrics meter not initialized, skipping export")
             return
         
         try:
-            metrics = self.tester.calculate_metrics()
-            registry = CollectorRegistry()
+            metrics_data = self.tester.calculate_metrics()
             
-            # Success status (1 = success, 0 = failure)
-            success_gauge = Gauge('ai_detector_eval_success', 
-                                 'Evaluation run success status', 
-                                 registry=registry)
-            success_gauge.set(1 if self.tester.stats['failed_requests'] == 0 else 0)
+            # Create observable gauges for current state metrics
+            # Note: In OTEL, we use callbacks for gauges to get current values
             
-            # Timestamp
-            timestamp_gauge = Gauge('ai_detector_eval_run_timestamp_seconds',
-                                   'Timestamp of evaluation run',
-                                   registry=registry)
-            timestamp_gauge.set(time.time())
+            def success_callback(options):
+                """Callback for success status gauge."""
+                yield metrics.Observation(
+                    1 if self.tester.stats['failed_requests'] == 0 else 0
+                )
             
-            # Duration
-            duration_gauge = Gauge('ai_detector_eval_duration_seconds',
-                                  'Duration of evaluation run',
-                                  registry=registry)
-            duration_gauge.set(run_duration)
+            def timestamp_callback(options):
+                """Callback for timestamp gauge."""
+                yield metrics.Observation(time.time())
             
+            def duration_callback(options):
+                """Callback for duration gauge."""
+                yield metrics.Observation(run_duration)
+            
+            def accuracy_callback(options):
+                """Callback for accuracy gauge."""
+                yield metrics.Observation(metrics_data.get('accuracy', 0))
+            
+            def precision_callback(options):
+                """Callback for precision gauge."""
+                yield metrics.Observation(metrics_data.get('precision', 0))
+            
+            def recall_callback(options):
+                """Callback for recall gauge."""
+                yield metrics.Observation(metrics_data.get('recall', 0))
+            
+            def f1_callback(options):
+                """Callback for F1 score gauge."""
+                yield metrics.Observation(metrics_data.get('f1_score', 0))
+            
+            # Create observable gauges (these are exported automatically)
+            success_gauge = self.meter.create_observable_gauge(
+                name="ai_detector_eval_success",
+                callbacks=[success_callback],
+                description="Evaluation run success status (1=success, 0=failure)",
+                unit="1"
+            )
+            
+            timestamp_gauge = self.meter.create_observable_gauge(
+                name="ai_detector_eval_run_timestamp_seconds",
+                callbacks=[timestamp_callback],
+                description="Timestamp of evaluation run",
+                unit="s"
+            )
+            
+            duration_gauge = self.meter.create_observable_gauge(
+                name="ai_detector_eval_duration_seconds",
+                callbacks=[duration_callback],
+                description="Duration of evaluation run",
+                unit="s"
+            )
+            
+            accuracy_gauge = self.meter.create_observable_gauge(
+                name="ai_detector_eval_accuracy",
+                callbacks=[accuracy_callback],
+                description="Overall accuracy",
+                unit="1"
+            )
+            
+            precision_gauge = self.meter.create_observable_gauge(
+                name="ai_detector_eval_precision",
+                callbacks=[precision_callback],
+                description="Precision metric",
+                unit="1"
+            )
+            
+            recall_gauge = self.meter.create_observable_gauge(
+                name="ai_detector_eval_recall",
+                callbacks=[recall_callback],
+                description="Recall metric",
+                unit="1"
+            )
+            
+            f1_gauge = self.meter.create_observable_gauge(
+                name="ai_detector_eval_f1",
+                callbacks=[f1_callback],
+                description="F1 score",
+                unit="1"
+            )
+            
+            # For metrics with labels (attributes in OTEL), we need counters
             # Sample counts by label
-            samples_gauge = Gauge('ai_detector_eval_samples_total',
-                                 'Total samples evaluated',
-                                 ['label'],
-                                 registry=registry)
             ai_count = self.tester.stats['true_positives'] + self.tester.stats['false_negatives']
             human_count = self.tester.stats['true_negatives'] + self.tester.stats['false_positives']
-            samples_gauge.labels(label='ai').set(ai_count)
-            samples_gauge.labels(label='human').set(human_count)
             
-            # Confusion matrix
-            confusion_gauge = Gauge('ai_detector_eval_confusion_matrix',
-                                   'Confusion matrix counts',
-                                   ['kind'],
-                                   registry=registry)
-            confusion_gauge.labels(kind='tp').set(self.tester.stats['true_positives'])
-            confusion_gauge.labels(kind='tn').set(self.tester.stats['true_negatives'])
-            confusion_gauge.labels(kind='fp').set(self.tester.stats['false_positives'])
-            confusion_gauge.labels(kind='fn').set(self.tester.stats['false_negatives'])
+            samples_counter = self.meter.create_counter(
+                name="ai_detector_eval_samples_total",
+                description="Total samples evaluated",
+                unit="1"
+            )
+            samples_counter.add(ai_count, {"label": "ai"})
+            samples_counter.add(human_count, {"label": "human"})
             
-            # Performance metrics
-            accuracy_gauge = Gauge('ai_detector_eval_accuracy',
-                                  'Overall accuracy',
-                                  registry=registry)
-            accuracy_gauge.set(metrics.get('accuracy', 0))
+            # Confusion matrix metrics
+            confusion_counter = self.meter.create_counter(
+                name="ai_detector_eval_confusion_matrix",
+                description="Confusion matrix counts",
+                unit="1"
+            )
+            confusion_counter.add(self.tester.stats['true_positives'], {"kind": "tp"})
+            confusion_counter.add(self.tester.stats['true_negatives'], {"kind": "tn"})
+            confusion_counter.add(self.tester.stats['false_positives'], {"kind": "fp"})
+            confusion_counter.add(self.tester.stats['false_negatives'], {"kind": "fn"})
             
-            precision_gauge = Gauge('ai_detector_eval_precision',
-                                   'Precision metric',
-                                   registry=registry)
-            precision_gauge.set(metrics.get('precision', 0))
-            
-            recall_gauge = Gauge('ai_detector_eval_recall',
-                                'Recall metric',
-                                registry=registry)
-            recall_gauge.set(metrics.get('recall', 0))
-            
-            f1_gauge = Gauge('ai_detector_eval_f1',
-                            'F1 score',
-                            registry=registry)
-            f1_gauge.set(metrics.get('f1_score', 0))
-            
-            # Push metrics
-            if use_remote_write:
-                # For remote write, send directly to the remote write endpoint
-                # This requires additional setup and authentication
-                headers = {
-                    'X-Scope-OrgID': os.getenv('PROMETHEUS_TENANT_ID', 'anonymous')  # Mimir tenant ID
-                }
-                auth_user = os.getenv('PROMETHEUS_REMOTE_WRITE_USER')
-                auth_pass = os.getenv('PROMETHEUS_REMOTE_WRITE_PASSWORD')
-                
-                if auth_user and auth_pass:
-                    import base64
-                    credentials = base64.b64encode(f"{auth_user}:{auth_pass}".encode()).decode()
-                    headers['Authorization'] = f'Basic {credentials}'
-                
-                # Convert metrics to Prometheus remote write format
-                from prometheus_client import exposition
-                metrics_data = exposition.generate_latest(registry)
-                
-                response = requests.post(
-                    remote_write_url,
-                    data=metrics_data,
-                    headers={**headers, 'Content-Type': 'text/plain; version=0.0.4'},
-                    timeout=10
-                )
-                response.raise_for_status()
-                print(f"✅ Metrics pushed via remote write to: {remote_write_url}")
-            else:
-                # Use traditional pushgateway
-                push_to_gateway(pushgateway_url, job=job_name, registry=registry)
-                print(f"✅ Metrics pushed to Pushgateway: {pushgateway_url}")
+            # Force a flush of metrics to ensure they're exported
+            if self.metrics_exporter:
+                print("✅ Metrics exported to Mimir via OpenTelemetry")
             
         except Exception as e:
-            print(f"⚠️ Failed to push metrics to Prometheus: {e}")
+            print(f"⚠️ Failed to export metrics: {e}")
+            import traceback
+            traceback.print_exc()
 
 
 def main():
@@ -945,7 +1015,6 @@ def main():
     parser.add_argument('--run-id', help='Unique run identifier (for tracking)')
     parser.add_argument('--dataset-version', help='Dataset version label')
     parser.add_argument('--commit-sha', help='Git commit SHA for tracking')
-    parser.add_argument('--pushgateway-url', help='Prometheus Pushgateway URL for metrics (or use PUSHGATEWAY_URL env var)')
     parser.add_argument('--save-jsonl', action='store_true', help='Save results in JSONL format')
     parser.add_argument('--save-manifest', action='store_true', help='Generate manifest.json with run metadata')
     parser.add_argument('--exit-on-error', action='store_true', help='Exit with error code if any tests fail')
@@ -953,7 +1022,6 @@ def main():
     # S3 and serverless arguments
     parser.add_argument('--s3-bucket', help='S3 bucket name for output files (or use S3_BUCKET_NAME env var)')
     parser.add_argument('--s3-prefix', default='', help='S3 key prefix for uploaded files')
-    parser.add_argument('--use-remote-write', action='store_true', help='Use Prometheus remote write instead of Pushgateway')
     
     args = parser.parse_args()
     
@@ -1037,14 +1105,8 @@ def main():
                     commit_sha=args.commit_sha
                 )
             
-            # NEW: Push metrics to Prometheus (Pushgateway or remote write)
-            pushgateway_url = args.pushgateway_url or os.getenv('PUSHGATEWAY_URL')
-            if pushgateway_url or args.use_remote_write:
-                tester.push_metrics_to_prometheus(
-                    pushgateway_url, 
-                    run_duration=run_duration,
-                    use_remote_write=args.use_remote_write
-                )
+            # Export metrics to Mimir via OpenTelemetry
+            tester.export_metrics_to_mimir(run_duration=run_duration)
             
             # Check for failures and set exit code
             if args.exit_on_error and tester.tester.stats['failed_requests'] > 0:

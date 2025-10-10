@@ -10,3 +10,7 @@ datasources:
     jsonData:
       httpMethod: POST
       timeInterval: 30s
+      httpHeaderName1: 'X-Scope-OrgID'
+    secureJsonData:
+      httpHeaderValue1: 'anonymous'
+

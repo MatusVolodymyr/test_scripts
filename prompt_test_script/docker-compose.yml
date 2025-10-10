@@ -1,7 +1,22 @@
 version: '3.8'
 
+# ============================================================================
+# LOCAL DEVELOPMENT STACK
+# ============================================================================
+# This Docker Compose file is for LOCAL DEVELOPMENT AND TESTING ONLY.
+# 
+# In PRODUCTION, your customer will:
+# 1. Run only the ai-detector-eval container
+# 2. Use their existing Grafana + Mimir infrastructure
+# 3. Set PROMETHEUS_REMOTE_WRITE_URL to their Mimir endpoint
+# 4. Set PROMETHEUS_TENANT_ID to their tenant ID
+#
+# This stack includes Mimir and Grafana so developers can test the full
+# metrics pipeline locally without needing external infrastructure.
+# ============================================================================
+
 services:
-  # Grafana Mimir - Modern metrics backend (replaces Pushgateway)
+  # Grafana Mimir - Metrics backend with Remote Write support
   mimir:
     image: grafana/mimir:latest
     command: ["-config.file=/etc/mimir.yaml"]
@@ -12,30 +27,6 @@ services:
       - mimir-data:/data
     networks:
       - eval-network
-  
-  # Pushgateway - Accepts pushed metrics from the script
-  pushgateway:
-    image: prom/pushgateway:latest
-    ports:
-      - "9091:9091"
-    networks:
-      - eval-network
-  
-  # Grafana Agent - Bridge between script and Mimir
-  # Scrapes Pushgateway and forwards to Mimir via remote write
-  grafana-agent:
-    image: grafana/agent:latest
-    command: ["-config.file=/etc/agent/agent.yaml", "-server.http.address=0.0.0.0:12345"]
-    ports:
-      - "12345:12345"  # Agent API/UI
-    volumes:
-      - ./agent-config.yaml:/etc/agent/agent.yaml
-      - agent-data:/tmp/agent
-    networks:
-      - eval-network
-    depends_on:
-      - mimir
-      - pushgateway
   
   # Grafana - Visualization dashboard
   grafana:
@@ -53,7 +44,6 @@ services:
       - eval-network
     depends_on:
       - mimir
-      - grafana-agent
   
   # AI Detector Evaluation Container
   ai-detector-eval:
@@ -69,8 +59,9 @@ services:
       - OPENAI_API_KEY=${OPENAI_API_KEY}
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
       
-      # Prometheus Pushgateway
-      - PUSHGATEWAY_URL=http://pushgateway:9091
+      # Prometheus Remote Write (via OpenTelemetry)
+      - PROMETHEUS_REMOTE_WRITE_URL=http://mimir:9009/api/v1/push
+      - PROMETHEUS_TENANT_ID=anonymous
       
       # Run Metadata
       - RUN_ID=${RUN_ID:-local-test-$(date +%s)}
@@ -98,7 +89,7 @@ services:
       - eval-network
     
     depends_on:
-      - grafana-agent
+      - mimir
     
     # Optional: Add resource limits
     deploy:
@@ -113,7 +104,6 @@ services:
 volumes:
   mimir-data:
   grafana-data:
-  agent-data:
 
 networks:
   eval-network:
