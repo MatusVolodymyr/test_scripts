@@ -1,0 +1,75 @@
+# Grafana Mimir Configuration for Local Testing
+# Minimal configuration for single-instance deployment
+
+target: all
+
+server:
+  http_listen_port: 9009
+  grpc_listen_port: 9095
+  log_level: info
+
+# Common configuration
+common:
+  storage:
+    backend: filesystem
+    filesystem:
+      dir: /data/mimir
+
+# Blocks storage configuration
+blocks_storage:
+  backend: filesystem
+  filesystem:
+    dir: /data/blocks
+
+# Distributor configuration
+distributor:
+  ring:
+    kvstore:
+      store: memberlist
+
+# Ingester configuration
+ingester:
+  ring:
+    kvstore:
+      store: memberlist
+    replication_factor: 1
+
+# Store gateway configuration
+store_gateway:
+  sharding_ring:
+    replication_factor: 1
+
+# Compactor configuration
+compactor:
+  data_dir: /data/compactor
+  sharding_ring:
+    kvstore:
+      store: memberlist
+
+# Limits configuration
+limits:
+  # Allow metrics without authentication
+  accept_ha_samples: true
+  max_global_series_per_user: 1000000
+  ingestion_rate: 100000
+  ingestion_burst_size: 200000
+
+# Memberlist configuration for single instance
+memberlist:
+  bind_port: 7946
+  join_members: []
+
+# Ruler configuration (optional, for alerting)
+ruler:
+  rule_path: /data/rules
+  ring:
+    kvstore:
+      store: memberlist
+
+# Alertmanager configuration (optional)
+alertmanager:
+  data_dir: /data/alertmanager
+  sharding_ring:
+    replication_factor: 1
+    kvstore:
+      store: memberlist

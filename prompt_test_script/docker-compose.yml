@@ -1,13 +1,59 @@
 version: '3.8'
 
 services:
-  # Prometheus Pushgateway for testing metrics locally
+  # Grafana Mimir - Modern metrics backend (replaces Pushgateway)
+  mimir:
+    image: grafana/mimir:latest
+    command: ["-config.file=/etc/mimir.yaml"]
+    ports:
+      - "9009:9009"  # HTTP
+    volumes:
+      - ./mimir-config.yaml:/etc/mimir.yaml
+      - mimir-data:/data
+    networks:
+      - eval-network
+  
+  # Pushgateway - Accepts pushed metrics from the script
   pushgateway:
     image: prom/pushgateway:latest
     ports:
       - "9091:9091"
     networks:
       - eval-network
+  
+  # Grafana Agent - Bridge between script and Mimir
+  # Scrapes Pushgateway and forwards to Mimir via remote write
+  grafana-agent:
+    image: grafana/agent:latest
+    command: ["-config.file=/etc/agent/agent.yaml", "-server.http.address=0.0.0.0:12345"]
+    ports:
+      - "12345:12345"  # Agent API/UI
+    volumes:
+      - ./agent-config.yaml:/etc/agent/agent.yaml
+      - agent-data:/tmp/agent
+    networks:
+      - eval-network
+    depends_on:
+      - mimir
+      - pushgateway
+  
+  # Grafana - Visualization dashboard
+  grafana:
+    image: grafana/grafana:latest
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_AUTH_ANONYMOUS_ENABLED=true
+      - GF_AUTH_ANONYMOUS_ORG_ROLE=Viewer
+    volumes:
+      - ./grafana-datasource.yaml:/etc/grafana/provisioning/datasources/mimir.yaml
+      - grafana-data:/var/lib/grafana
+    networks:
+      - eval-network
+    depends_on:
+      - mimir
+      - grafana-agent
   
   # AI Detector Evaluation Container
   ai-detector-eval:
@@ -23,11 +69,11 @@ services:
       - OPENAI_API_KEY=${OPENAI_API_KEY}
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
       
-      # Prometheus
+      # Prometheus Pushgateway
       - PUSHGATEWAY_URL=http://pushgateway:9091
       
       # Run Metadata
-      - RUN_ID=${RUN_ID:-local-test}
+      - RUN_ID=${RUN_ID:-local-test-$(date +%s)}
       - DATASET_VERSION=${DATASET_VERSION:-v1.0}
       - GIT_COMMIT_SHA=${GIT_COMMIT_SHA:-local}
       
@@ -47,13 +93,12 @@ services:
       --save-jsonl
       --save-manifest
       --output-dir /tmp/output
-      --pushgateway-url http://pushgateway:9091
     
     networks:
       - eval-network
     
     depends_on:
-      - pushgateway
+      - grafana-agent
     
     # Optional: Add resource limits
     deploy:
@@ -64,6 +109,11 @@ services:
         reservations:
           cpus: '1.0'
           memory: 1G
+
+volumes:
+  mimir-data:
+  grafana-data:
+  agent-data:
 
 networks:
   eval-network:

@@ -23,12 +23,22 @@ import time
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Any, Optional
+from io import StringIO, BytesIO
 from tqdm import tqdm
 import requests
 from dotenv import load_dotenv
 
 # Load environment variables
 load_dotenv(".env")
+
+# Try to import boto3 for S3 support
+try:
+    import boto3
+    from botocore.exceptions import ClientError
+    S3_AVAILABLE = True
+except ImportError:
+    S3_AVAILABLE = False
+    print("⚠️ boto3 not installed. S3 support will be disabled.")
 
 # Try to import Prometheus client for metrics export
 try:
@@ -454,19 +464,95 @@ class DetectorAPITester:
         print("="*60)
 
 
+class S3Helper:
+    """Helper class for S3 operations."""
+    
+    def __init__(self, bucket_name: str = None, prefix: str = ""):
+        self.bucket_name = bucket_name or os.getenv('S3_BUCKET_NAME')
+        self.prefix = prefix.strip('/') + '/' if prefix else ''
+        self.s3_client = None
+        
+        if S3_AVAILABLE and self.bucket_name:
+            try:
+                self.s3_client = boto3.client('s3')
+                print(f"✅ S3 client initialized (bucket: {self.bucket_name})")
+            except Exception as e:
+                print(f"⚠️ S3 client initialization failed: {e}")
+    
+    def is_available(self) -> bool:
+        """Check if S3 is available and configured."""
+        return self.s3_client is not None and self.bucket_name is not None
+    
+    def upload_file(self, local_path: str, s3_key: str = None) -> bool:
+        """Upload a local file to S3."""
+        if not self.is_available():
+            return False
+        
+        try:
+            if s3_key is None:
+                s3_key = self.prefix + Path(local_path).name
+            else:
+                s3_key = self.prefix + s3_key
+            
+            self.s3_client.upload_file(local_path, self.bucket_name, s3_key)
+            print(f"✅ Uploaded to S3: s3://{self.bucket_name}/{s3_key}")
+            return True
+        except ClientError as e:
+            print(f"❌ Failed to upload {local_path} to S3: {e}")
+            return False
+    
+    def upload_string(self, content: str, s3_key: str, content_type: str = 'text/plain') -> bool:
+        """Upload string content directly to S3."""
+        if not self.is_available():
+            return False
+        
+        try:
+            s3_key = self.prefix + s3_key
+            self.s3_client.put_object(
+                Bucket=self.bucket_name,
+                Key=s3_key,
+                Body=content.encode('utf-8'),
+                ContentType=content_type
+            )
+            print(f"✅ Uploaded to S3: s3://{self.bucket_name}/{s3_key}")
+            return True
+        except ClientError as e:
+            print(f"❌ Failed to upload content to S3: {e}")
+            return False
+    
+    def upload_json(self, data: dict, s3_key: str) -> bool:
+        """Upload JSON data to S3."""
+        content = json.dumps(data, indent=2, ensure_ascii=False)
+        return self.upload_string(content, s3_key, content_type='application/json')
+    
+    def download_to_string(self, s3_key: str) -> Optional[str]:
+        """Download S3 object to string."""
+        if not self.is_available():
+            return None
+        
+        try:
+            s3_key = self.prefix + s3_key
+            response = self.s3_client.get_object(Bucket=self.bucket_name, Key=s3_key)
+            return response['Body'].read().decode('utf-8')
+        except ClientError as e:
+            print(f"❌ Failed to download from S3: {e}")
+            return None
+
+
 class PromptBasedTester:
     """Main class that orchestrates generation and testing."""
     
-    def __init__(self, api_url: str = None, token: str = None):
+    def __init__(self, api_url: str = None, token: str = None, s3_bucket: str = None, s3_prefix: str = ""):
         self.generator = AITextGenerator()
         self.tester = DetectorAPITester(
             api_url or os.getenv('DETECTOR_API_URL', 'http://localhost:8000'),
             token or os.getenv('DETECTOR_API_TOKEN')
         )
+        self.s3_helper = S3Helper(s3_bucket, s3_prefix)
         self.generated_data = []
     
     def load_prompts(self, csv_file: str) -> List[Dict[str, Any]]:
-        """Load prompts and human texts from CSV file."""
+        """Load prompts and human texts from local CSV file."""
         prompts_data = []
         
         with open(csv_file, 'r', encoding='utf-8') as f:
@@ -487,6 +573,57 @@ class PromptBasedTester:
                 })
         
         print(f"Loaded {len(prompts_data)} items from {csv_file}")
+        return prompts_data
+    
+    def load_prompts_from_s3(self, s3_path: str) -> List[Dict[str, Any]]:
+        """Load prompts and human texts from S3 CSV file.
+        
+        Args:
+            s3_path: S3 path in format 's3://bucket/key' or 'bucket/key'
+        
+        Returns:
+            List of prompt dictionaries
+        """
+        if not self.s3_helper.is_available():
+            raise RuntimeError("S3 not available. Install boto3 and configure S3_BUCKET_NAME")
+        
+        # Parse S3 path
+        if s3_path.startswith('s3://'):
+            s3_path = s3_path[5:]  # Remove 's3://' prefix
+        
+        parts = s3_path.split('/', 1)
+        if len(parts) != 2:
+            raise ValueError(f"Invalid S3 path format: {s3_path}. Expected 's3://bucket/key' or 'bucket/key'")
+        
+        bucket, key = parts
+        
+        # Download from S3
+        print(f"Downloading prompts from s3://{bucket}/{key}...")
+        content = self.s3_helper.s3_client.get_object(Bucket=bucket, Key=key)['Body'].read().decode('utf-8')
+        
+        if not content:
+            raise ValueError(f"Empty file downloaded from s3://{bucket}/{key}")
+        
+        # Parse CSV from string
+        prompts_data = []
+        reader = csv.DictReader(StringIO(content))
+        
+        for row in reader:
+            prompts_data.append({
+                'type': row['type'].strip(),
+                'content': row['content'],
+                'model': row.get('model', '').strip(),
+                'temperature': float(row.get('temperature', 0.7)) if row.get('temperature') and row.get('temperature') != 'N/A' else 0.7,
+                'max_tokens': int(row.get('max_tokens', 300)) if row.get('max_tokens') and row.get('max_tokens') != 'N/A' else 300,
+                'style': row.get('style', ''),
+                'domain': row.get('domain', ''),
+                'expected_label': row.get('expected_label', '').strip(),
+                'confidence': float(row.get('confidence', 1.0)) if row.get('confidence') else 1.0,
+                'language': row.get('language', 'en'),
+                'notes': row.get('notes', '')
+            })
+        
+        print(f"✅ Loaded {len(prompts_data)} items from s3://{bucket}/{key}")
         return prompts_data
     
     def generate_texts(self, prompts_data: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -585,6 +722,10 @@ class PromptBasedTester:
                 ])
         
         print(f"Generated test data saved to: {output_file}")
+        
+        # Also upload to S3 if available
+        if self.s3_helper.is_available():
+            self.s3_helper.upload_file(output_file)
     
     def generate_report(self, output_file: str) -> None:
         """Generate comprehensive test report."""
@@ -611,6 +752,10 @@ class PromptBasedTester:
             json.dump(report, f, indent=2, ensure_ascii=False)
         
         print(f"Detailed report saved to: {output_file}")
+        
+        # Also upload to S3 if available
+        if self.s3_helper.is_available():
+            self.s3_helper.upload_file(output_file)
     
     def save_results_jsonl(self, output_file: str) -> None:
         """Save results in JSONL format for streaming/S3 storage."""
@@ -619,6 +764,10 @@ class PromptBasedTester:
                 f.write(json.dumps(result, ensure_ascii=False) + '\n')
         
         print(f"JSONL results saved to: {output_file}")
+        
+        # Also upload to S3 if available
+        if self.s3_helper.is_available():
+            self.s3_helper.upload_file(output_file)
     
     def generate_manifest(self, output_file: str, run_id: str = None, 
                          dataset_version: str = None, commit_sha: str = None) -> None:
@@ -657,12 +806,27 @@ class PromptBasedTester:
             json.dump(manifest, f, indent=2, ensure_ascii=False)
         
         print(f"Manifest saved to: {output_file}")
+        
+        # Also upload to S3 if available
+        if self.s3_helper.is_available():
+            self.s3_helper.upload_file(output_file)
     
-    def push_metrics_to_prometheus(self, pushgateway_url: str, job_name: str = 'ai_detector_eval',
-                                   run_duration: float = 0) -> None:
-        """Push metrics to Prometheus Pushgateway."""
+    def push_metrics_to_prometheus(self, pushgateway_url: str = None, job_name: str = 'ai_detector_eval',
+                                   run_duration: float = 0, use_remote_write: bool = False) -> None:
+        """Push metrics to Prometheus Pushgateway or via remote write."""
         if not PROMETHEUS_AVAILABLE:
             print("⚠️ Prometheus client not available, skipping metrics push")
+            return
+        
+        # Get remote write URL from env if not using pushgateway
+        remote_write_url = os.getenv('PROMETHEUS_REMOTE_WRITE_URL')
+        
+        if use_remote_write and not remote_write_url:
+            print("⚠️ Remote write requested but PROMETHEUS_REMOTE_WRITE_URL not set")
+            return
+        
+        if not use_remote_write and not pushgateway_url:
+            print("⚠️ No Prometheus endpoint configured")
             return
         
         try:
@@ -728,9 +892,37 @@ class PromptBasedTester:
                             registry=registry)
             f1_gauge.set(metrics.get('f1_score', 0))
             
-            # Push to gateway
-            push_to_gateway(pushgateway_url, job=job_name, registry=registry)
-            print(f"✅ Metrics pushed to Pushgateway: {pushgateway_url}")
+            # Push metrics
+            if use_remote_write:
+                # For remote write, send directly to the remote write endpoint
+                # This requires additional setup and authentication
+                headers = {
+                    'X-Scope-OrgID': os.getenv('PROMETHEUS_TENANT_ID', 'anonymous')  # Mimir tenant ID
+                }
+                auth_user = os.getenv('PROMETHEUS_REMOTE_WRITE_USER')
+                auth_pass = os.getenv('PROMETHEUS_REMOTE_WRITE_PASSWORD')
+                
+                if auth_user and auth_pass:
+                    import base64
+                    credentials = base64.b64encode(f"{auth_user}:{auth_pass}".encode()).decode()
+                    headers['Authorization'] = f'Basic {credentials}'
+                
+                # Convert metrics to Prometheus remote write format
+                from prometheus_client import exposition
+                metrics_data = exposition.generate_latest(registry)
+                
+                response = requests.post(
+                    remote_write_url,
+                    data=metrics_data,
+                    headers={**headers, 'Content-Type': 'text/plain; version=0.0.4'},
+                    timeout=10
+                )
+                response.raise_for_status()
+                print(f"✅ Metrics pushed via remote write to: {remote_write_url}")
+            else:
+                # Use traditional pushgateway
+                push_to_gateway(pushgateway_url, job=job_name, registry=registry)
+                print(f"✅ Metrics pushed to Pushgateway: {pushgateway_url}")
             
         except Exception as e:
             print(f"⚠️ Failed to push metrics to Prometheus: {e}")
@@ -738,7 +930,8 @@ class PromptBasedTester:
 
 def main():
     parser = argparse.ArgumentParser(description='AI Detector Prompt-Based Testing')
-    parser.add_argument('--input', required=True, help='Input CSV file with prompts and human texts')
+    parser.add_argument('--input', help='Input CSV file with prompts (local path or s3://bucket/key)')
+    parser.add_argument('--s3-input', action='store_true', help='Treat --input as S3 path (s3://bucket/key)')
     parser.add_argument('--api-url', help='Detector API base URL (or use DETECTOR_API_URL env var)')
     parser.add_argument('--token', help='Detector API authentication token (or use DETECTOR_API_TOKEN env var)')
     parser.add_argument('--output-dir', default='test_results', help='Output directory for results')
@@ -748,7 +941,7 @@ def main():
     parser.add_argument('--generate-and-test', action='store_true', help='Generate texts and test them')
     parser.add_argument('--quiet', action='store_true', help='Minimal console output')
     
-    # New: Production/automation arguments
+    # Production/automation arguments
     parser.add_argument('--run-id', help='Unique run identifier (for tracking)')
     parser.add_argument('--dataset-version', help='Dataset version label')
     parser.add_argument('--commit-sha', help='Git commit SHA for tracking')
@@ -756,6 +949,11 @@ def main():
     parser.add_argument('--save-jsonl', action='store_true', help='Save results in JSONL format')
     parser.add_argument('--save-manifest', action='store_true', help='Generate manifest.json with run metadata')
     parser.add_argument('--exit-on-error', action='store_true', help='Exit with error code if any tests fail')
+    
+    # S3 and serverless arguments
+    parser.add_argument('--s3-bucket', help='S3 bucket name for output files (or use S3_BUCKET_NAME env var)')
+    parser.add_argument('--s3-prefix', default='', help='S3 key prefix for uploaded files')
+    parser.add_argument('--use-remote-write', action='store_true', help='Use Prometheus remote write instead of Pushgateway')
     
     args = parser.parse_args()
     
@@ -767,8 +965,8 @@ def main():
     output_dir = Path(args.output_dir)
     output_dir.mkdir(exist_ok=True)
     
-    # Initialize tester
-    tester = PromptBasedTester(args.api_url, args.token)
+    # Initialize tester with S3 support
+    tester = PromptBasedTester(args.api_url, args.token, args.s3_bucket, args.s3_prefix)
     
     # Track run duration for metrics
     start_time = time.time()
@@ -778,8 +976,19 @@ def main():
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
         
         if args.generate_only or args.generate_and_test:
-            # Load prompts and generate texts
-            prompts_data = tester.load_prompts(args.input)
+            # Load prompts from S3 or local file
+            if args.s3_input:
+                if not args.input:
+                    print("❌ Error: --input required when using --s3-input")
+                    return 1
+                prompts_data = tester.load_prompts_from_s3(args.input)
+            else:
+                if not args.input:
+                    print("❌ Error: --input required")
+                    return 1
+                prompts_data = tester.load_prompts(args.input)
+            
+            # Generate texts
             test_data = tester.generate_texts(prompts_data)
             
             # Save generated data
@@ -828,10 +1037,14 @@ def main():
                     commit_sha=args.commit_sha
                 )
             
-            # NEW: Push metrics to Prometheus if URL provided
+            # NEW: Push metrics to Prometheus (Pushgateway or remote write)
             pushgateway_url = args.pushgateway_url or os.getenv('PUSHGATEWAY_URL')
-            if pushgateway_url:
-                tester.push_metrics_to_prometheus(pushgateway_url, run_duration=run_duration)
+            if pushgateway_url or args.use_remote_write:
+                tester.push_metrics_to_prometheus(
+                    pushgateway_url, 
+                    run_duration=run_duration,
+                    use_remote_write=args.use_remote_write
+                )
             
             # Check for failures and set exit code
             if args.exit_on_error and tester.tester.stats['failed_requests'] > 0:
